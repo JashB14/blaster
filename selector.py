@@ -9,6 +9,13 @@ COVERAGE = Path("/app/coverage_map.json.gz")
 POOL_COVERAGE = Path("/app/pool_map.json.gz")
 MAX_WORKERS = 8
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Which tests read which fixture files (found by reading tests/ at the pinned commit).
+EXTRA_FIXTURE_TESTS = [
+    ("optimizer/tpc-h/", ["tests/test_executor.py::", "::test_tpch", "::test_tpcds"]),
+    ("optimizer/tpc-ds/", ["tests/test_executor.py::", "::test_tpch", "::test_tpcds"]),
+    ("optimizer/annotate_functions.sql", ["::test_annotate_funcs"]),
+    ("fixtures/identity.sql", ["tests/test_serde.py::"]),
+]
 
 
 def split(tests: list[dict], worker_count: int) -> list[list[int]]:
@@ -94,6 +101,12 @@ def main() -> None:
             # Handle SQL fixture changes.
             if file_path.startswith("tests/fixtures/"):
                 fixture_name = Path(file_path).stem
+                # Tests that read this fixture under names the heuristic can't match.
+                for needle, id_parts in EXTRA_FIXTURE_TESTS:
+                    if needle in file_path:
+                        for test in tests:
+                            if any(part in test["id"] for part in id_parts):
+                                selected_numbers.add(test["number"])
 
                 # Remove fixture-specific suffixes to match related test names.
                 normalized_name = fixture_name.removesuffix("_ddl").rstrip("s")
@@ -113,19 +126,10 @@ def main() -> None:
                 line_map = coverage.get(file_path, {})
                 pool_line_map = pool_coverage.get(file_path, {})
 
-                file_tests = None
                 for line in lines:
                     found = set(line_map.get(str(line), [])) | set(pool_line_map.get(str(line), []))
-                    if found:
-                        selected_numbers.update(found)
-                    elif line >= 1:
-                        # No test ever ran this line (import-time code, constants,
-                        # blank or comment lines): select every test that touches the file.
-                        if file_tests is None:
-                            file_tests = {n for nums in line_map.values() for n in nums}
-                            file_tests |= {n for nums in pool_line_map.values() for n in nums}
-                        selected_numbers.update(file_tests)
-
+                    selected_numbers.update(found)
+                    
         selected = [
             tests_by_number[number]
             for number in sorted(selected_numbers)
