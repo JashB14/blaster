@@ -254,6 +254,7 @@ def main() -> None:
 
         for file_path, lines in changed_lines(patch_text).items():
 
+
             # Handle fixture changes.
             if file_path.startswith("tests/fixtures/"):
                 tracked = fixture_map.get(file_path, [])
@@ -261,7 +262,7 @@ def main() -> None:
 
                 # Name heuristic, kept as a union with the tracker's fixture map.
                 name = Path(file_path).stem.removesuffix("_ddl").rstrip("s")
-                if name:
+                if name and not tracked:
                     for test in tests:
                         if name in test["id"]:
                             picked_numbers.add(test["number"])
@@ -282,6 +283,22 @@ def main() -> None:
             # Handle Python source changes.
             elif file_path.startswith("sqlglot/") and file_path.endswith(".py"):
                 picked_idx |= tests_for_lines(file_path, lines)
+
+            # Handle test-file changes (the syntax guard already caught unparseable ones).
+            elif file_path.startswith("tests/") and file_path.endswith(".py"):
+                name = Path(file_path).name
+                if name.startswith("test_") and name != "test_dialect.py":
+                    for test in tests:
+                        if test["file"] == file_path:
+                            picked_numbers.add(test["number"])
+                elif name == "test_dialect.py":
+                    # holds the shared Validator base class used by every dialect test
+                    for test in tests:
+                        if test["file"].startswith("tests/dialects/"):
+                            picked_numbers.add(test["number"])
+                else:
+                    # helpers.py, conftest.py, __init__.py: anything may depend on them
+                    picked_numbers.update(tests_by_number)
 
         for i in picked_idx:
             number = idx_to_number[i]
