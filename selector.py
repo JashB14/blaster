@@ -244,6 +244,11 @@ def main() -> None:
     unknown_numbers = {test["number"] for test in tests if test["id"] not in known_ids}
 
     def select_for_patch(patch_text: str) -> set[int]:
+        broken = broken_python_files(patch_text)
+        if broken:
+            print(f"  syntax error after patch in {broken}; selecting every test", file=sys.stderr)
+            return set(tests_by_number)
+
         picked_idx: set[int] = set()
         picked_numbers: set[int] = set()
 
