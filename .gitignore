@@ -1,0 +1,11 @@
+sample/
+output.jsonl
+coverage_map.json
+coverage.json
+coverage_pool.json
+pool_out/
+*.tar.gz
+*.log
+__pycache__/
+.DS_Store
+selector_working_backup.py

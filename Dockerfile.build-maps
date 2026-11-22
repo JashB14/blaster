@@ -1,0 +1,27 @@
+
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/tobymao/sqlglot.git /app/sqlglot \
+    && git -C /app/sqlglot checkout eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+RUN pip install --no-cache-dir coverage
+RUN pip install --no-cache-dir pytest-cov
+
+RUN cd /app/sqlglot && SKIP_INTEGRATION=0 python -m pytest -q --cov=sqlglot --cov-context=test --cov-report= || test -f .coverage
+RUN cd /app/sqlglot && python -m coverage json --show-contexts -o /app/coverage.json
+
+COPY sample/tests.json /app/tests.json
+COPY build_coverage_map.py /app/build_coverage_map.py
+RUN python /app/build_coverage_map.py
+
+COPY pool_map.json.gz /app/pool_map.json.gz
+COPY selector.py /app/selector.py
+
+ENV PYTHONPATH=/app/sqlglot
+
+CMD ["python", "/app/selector.py"]
