@@ -111,10 +111,13 @@ def tests_for_lines(path: str, lines: set[int]) -> set[int]:
         here = set(sets[eff[i - 1]])
 
         # Also take the enclosing if/for/try/with headers (they decide whether the line runs).
-        cur, parent = i, par[i - 1]
-        while 0 < parent < cur:
-            here |= set(sets[eff[parent - 1]])
-            cur, parent = parent, par[parent - 1]
+                # Only when no test ran this line, fall back to the enclosing
+        # if/for/try/with headers (they decide whether the line runs).
+        if not here:
+            cur, parent = i, par[i - 1]
+            while 0 < parent < cur:
+                here |= set(sets[eff[parent - 1]])
+                cur, parent = parent, par[parent - 1]
 
         if not here:
             print(f"  no tests for {path}:{line}", file=sys.stderr)
