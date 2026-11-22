@@ -1,6 +1,7 @@
 import argparse, ast, bisect, gzip, json
 from collections import defaultdict
 from pathlib import Path
+import ijson
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--repo", default="/app/sqlglot")
@@ -30,16 +31,18 @@ raw = defaultdict(lambda: defaultdict(set))
 
 
 def add_cov(path, suffixes):
-    for fp, fd in load_json(path)["files"].items():
-        for line, ctxs in fd.get("contexts", {}).items():
-            for c in ctxs:
-                if suffixes:
-                    s = next((s for s in suffixes if c.endswith(s)), None)
-                    if not s:
-                        continue
-                    c = c[: -len(s)]
-                if c in idx:
-                    raw[fp][int(line)].add(idx[c])
+    p = str(path)
+    with (gzip.open(p, "rb") if p.endswith(".gz") else open(p, "rb")) as f:
+        for fp, fd in ijson.kvitems(f, "files"):
+            for line, ctxs in fd.get("contexts", {}).items():
+                for c in ctxs:
+                    if suffixes:
+                        s = next((s for s in suffixes if c.endswith(s)), None)
+                        if not s:
+                            continue
+                        c = c[: -len(s)]
+                    if c in idx:
+                        raw[fp][int(line)].add(idx[c])
 
 
 add_cov(a.cov, ("|run", "|setup"))
@@ -71,9 +74,32 @@ def start_of(s):
     return min([s.lineno] + [d.lineno for d in getattr(s, "decorator_list", [])])
 
 
+def import_lines(tree):
+    """Lines that run once at import time, not inside a function body."""
+    imp = set()
+
+    def walk(stmts):
+        for s in stmts:
+            x = start_of(s)
+            if isinstance(s, FUNCS + (ast.ClassDef,)):
+                imp.update(range(x, s.body[0].lineno))
+                if isinstance(s, ast.ClassDef):
+                    walk(s.body)
+            elif isinstance(s, COMPOUND):
+                imp.update(range(x, s.body[0].lineno))
+                for b in blocks(s):
+                    walk(b)
+            else:
+                imp.update(range(x, s.end_lineno + 1))
+
+    walk(tree.body)
+    return imp
+
 def build(rel, src):
     n = len(src.splitlines())
-    r = raw.get(rel, {})
+    tree = ast.parse(src)
+    imp = import_lines(tree)
+    r = {l: s for l, s in raw.get(rel, {}).items() if l not in imp}
     cl = sorted(r)
 
     def span(x, y):
@@ -120,7 +146,7 @@ def build(rel, src):
             else:
                 put(x, y, span(x, y), hdr)
 
-    visit(ast.parse(src).body, "import", 0, allset, "")
+    visit(tree.body, "import", 0, allset, "")
     tbl, ix = [], {}
 
     def sid(s):

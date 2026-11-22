@@ -1,15 +1,16 @@
-import gzip
 import json
 import re
 import sys
 from pathlib import Path
 
 DATA = Path("/data")
-COVERAGE = Path("/app/coverage_map.json.gz")
-POOL_COVERAGE = Path("/app/pool_map.json.gz")
+MAPS = Path("/app/maps")
 MAX_WORKERS = 8
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
 # Which tests read which fixture files (found by reading tests/ at the pinned commit).
+# Kept as a union with maps/fixtures.json: the tracker cannot see setUpClass work
+# credited to every test in a class, or files DuckDB reads natively.
 EXTRA_FIXTURE_TESTS = [
     ("optimizer/tpc-h/", ["tests/test_executor.py::", "::test_tpch", "::test_tpcds"]),
     ("optimizer/tpc-ds/", ["tests/test_executor.py::", "::test_tpch", "::test_tpcds"]),
@@ -43,7 +44,9 @@ def changed_lines(patch_text: str) -> dict[str, set[int]]:
         if old_left > 0 or new_left > 0:
             tag = line[:1]
             if tag == "-":
-                if current:
+                text = line[1:].strip()
+                # Removed blank or comment lines cannot change behavior.
+                if current and text and not text.startswith("#"):
                     changes[current].add(old_line)
                 old_line += 1
                 old_left -= 1
@@ -83,53 +86,105 @@ def changed_lines(patch_text: str) -> dict[str, set[int]]:
     return changes
 
 
+def load_shard(path: str):
+    shard_file = MAPS / "shards" / (path.replace("/", "__") + ".json")
+    if not shard_file.exists():
+        return None
+    return json.loads(shard_file.read_text())
+
+
+def tests_for_lines(path: str, lines: set[int]) -> set[int]:
+    """Map-index set of the tests that can be affected by edits to these old lines."""
+    shard = load_shard(path)
+    if shard is None:
+        print(f"  no map for {path}", file=sys.stderr)
+        return set()
+
+    sets, eff, par = shard["sets"], shard["eff"], shard["par"]
+    n = len(eff)
+    found: set[int] = set()
+
+    for line in sorted(lines):
+        if line < 1 or n == 0:
+            continue
+        i = min(line, n)  # an insertion after the last line maps to the last line
+        here = set(sets[eff[i - 1]])
+
+        # Also take the enclosing if/for/try/with headers (they decide whether the line runs).
+        cur, parent = i, par[i - 1]
+        while 0 < parent < cur:
+            here |= set(sets[eff[parent - 1]])
+            cur, parent = parent, par[parent - 1]
+
+        if not here:
+            print(f"  no tests for {path}:{line}", file=sys.stderr)
+        found |= here
+
+    return found
+
+
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    with gzip.open(COVERAGE, "rt") as coverage_file:
-        coverage = json.load(coverage_file)
-    with gzip.open(POOL_COVERAGE, "rt") as pool_file:
-        pool_coverage = json.load(pool_file)
-
     tests_by_number = {test["number"]: test for test in tests}
 
-    for patch in sorted((DATA / "commits").glob("*.patch")):
-        changes = changed_lines(patch.read_text())
-        selected_numbers = set()
+    ids = json.loads((MAPS / "ids.json").read_text())
+    fixture_map = json.loads((MAPS / "fixtures.json").read_text())
+    number_of_id = {test["id"]: test["number"] for test in tests}
+    idx_to_number = [number_of_id.get(test_id) for test_id in ids]
+    known_ids = set(ids)
+    # Tests the maps have never seen (renumbered or new): add them whenever a change is selected.
+    unknown_numbers = {test["number"] for test in tests if test["id"] not in known_ids}
 
-        for file_path, lines in changes.items():
+    def select_for_patch(patch_text: str) -> set[int]:
+        picked_idx: set[int] = set()
+        picked_numbers: set[int] = set()
 
-            # Handle SQL fixture changes.
+        for file_path, lines in changed_lines(patch_text).items():
+
+            # Handle fixture changes.
             if file_path.startswith("tests/fixtures/"):
-                fixture_name = Path(file_path).stem
-                # Tests that read this fixture under names the heuristic can't match.
-                for needle, id_parts in EXTRA_FIXTURE_TESTS:
-                    if needle in file_path:
-                        for test in tests:
-                            if any(part in test["id"] for part in id_parts):
-                                selected_numbers.add(test["number"])
+                picked_idx.update(fixture_map.get(file_path, []))
 
-                # Remove fixture-specific suffixes to match related test names.
-                normalized_name = fixture_name.removesuffix("_ddl").rstrip("s")
-
-                for test in tests:
-                    if normalized_name in test["id"]:
-                        selected_numbers.add(test["number"])
+                # Name heuristic, kept as a union with the tracker's fixture map.
+                name = Path(file_path).stem.removesuffix("_ddl").rstrip("s")
+                if name:
+                    for test in tests:
+                        if name in test["id"]:
+                            picked_numbers.add(test["number"])
 
                 # General optimizer integration test.
                 if file_path.startswith("tests/fixtures/optimizer/"):
                     for test in tests:
                         if test["id"].endswith("::test_optimize"):
-                            selected_numbers.add(test["number"])
+                            picked_numbers.add(test["number"])
+
+                # Tests that read this fixture under names the heuristic can't match.
+                for needle, id_parts in EXTRA_FIXTURE_TESTS:
+                    if needle in file_path:
+                        for test in tests:
+                            if any(part in test["id"] for part in id_parts):
+                                picked_numbers.add(test["number"])
 
             # Handle Python source changes.
-            if file_path.startswith("sqlglot/"):
-                line_map = coverage.get(file_path, {})
-                pool_line_map = pool_coverage.get(file_path, {})
+            elif file_path.startswith("sqlglot/") and file_path.endswith(".py"):
+                picked_idx |= tests_for_lines(file_path, lines)
 
-                for line in lines:
-                    found = set(line_map.get(str(line), [])) | set(pool_line_map.get(str(line), []))
-                    selected_numbers.update(found)
-                    
+        for i in picked_idx:
+            number = idx_to_number[i]
+            if number is not None:
+                picked_numbers.add(number)
+
+        if picked_numbers:
+            picked_numbers |= unknown_numbers
+        return picked_numbers
+
+    for patch in sorted((DATA / "commits").glob("*.patch")):
+        try:
+            selected_numbers = select_for_patch(patch.read_text())
+        except Exception as exc:  # never crash: fall back to every test
+            print(f"{patch.stem}: ERROR {exc!r}; selecting every test", file=sys.stderr)
+            selected_numbers = set(tests_by_number)
+
         selected = [
             tests_by_number[number]
             for number in sorted(selected_numbers)
