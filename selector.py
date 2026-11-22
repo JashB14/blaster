@@ -85,6 +85,111 @@ def changed_lines(patch_text: str) -> dict[str, set[int]]:
 
     return changes
 
+# ---- Syntax guard: paste these definitions into selector.py (after changed_lines) ----
+#
+# A patch that leaves a Python file unparseable makes every test that imports it
+# fail, and line coverage cannot see that. This applies the patch to the pinned
+# sqlglot source in memory and parses the result. It only ever ADDS tests, and
+# for a patch that still parses it changes nothing.
+
+import ast
+
+SQLGLOT_ROOT = Path("/app/sqlglot")
+
+
+def parse_patch(patch_text: str) -> dict[str, list[tuple[int, int, list[str]]]]:
+    """Return {path: [(old_start, old_count, body_lines), ...]} for every file in the patch."""
+    files: dict[str, list[tuple[int, int, list[str]]]] = {}
+    old_path = None
+    current = None
+    body: list[str] = []
+    old_left = new_left = 0
+    hunk = None
+
+    for line in patch_text.splitlines():
+        if old_left > 0 or new_left > 0:
+            tag = line[:1]
+            if tag == "-":
+                old_left -= 1
+            elif tag == "+":
+                new_left -= 1
+            elif tag == "\\":
+                continue
+            else:
+                old_left -= 1
+                new_left -= 1
+            body.append(line)
+            if old_left <= 0 and new_left <= 0 and hunk is not None and current:
+                files[current].append((hunk[0], hunk[1], body))
+                body = []
+            continue
+
+        if line.startswith("--- "):
+            path = line[4:].split("\t")[0]
+            old_path = path[2:] if path.startswith("a/") else None
+        elif line.startswith("+++ "):
+            path = line[4:].split("\t")[0]
+            new_path = path[2:] if path.startswith("b/") else None
+            current = old_path or new_path
+            if current:
+                files.setdefault(current, [])
+        elif line.startswith("@@"):
+            m = HUNK.match(line)
+            if m:
+                old_count = 1 if m[2] is None else int(m[2])
+                new_count = 1 if m[4] is None else int(m[4])
+                hunk = (int(m[1]), old_count)
+                old_left, new_left = old_count, new_count
+                body = []
+    return files
+
+
+def apply_hunks(old_lines: list[str], hunks: list[tuple[int, int, list[str]]]) -> list[str]:
+    out: list[str] = []
+    pos = 0
+    for old_start, old_count, body in hunks:
+        # "-5,0" means "insert after old line 5", so the next old line (0-based) is index 5.
+        start = old_start - 1 if old_count else old_start
+        out.extend(old_lines[pos:start])
+        pos = start
+        for line in body:
+            tag, text = line[:1], line[1:]
+            if tag == "-":
+                pos += 1
+            elif tag == "+":
+                out.append(text)
+            elif tag != "\\":
+                out.append(text)
+                pos += 1
+    out.extend(old_lines[pos:])
+    return out
+
+
+def broken_python_files(patch_text: str) -> list[str]:
+    """Paths (sqlglot/ or tests/) of .py files that no longer parse once the patch is applied."""
+    broken = []
+    for path, hunks in parse_patch(patch_text).items():
+        if not path.endswith(".py") or not path.startswith(("sqlglot/", "tests/")):
+            continue
+        source = SQLGLOT_ROOT / path
+        old_lines = source.read_text().splitlines() if source.exists() else []
+        new_text = "\n".join(apply_hunks(old_lines, hunks)) + "\n"
+        try:
+            ast.parse(new_text, filename=path)
+        except (SyntaxError, ValueError):
+            broken.append(path)
+    return broken
+
+# ---- In select_for_patch, add these lines at the very top of the function body: ----
+#
+#     broken = broken_python_files(patch_text)
+#     if broken:
+#         print(f"  syntax error after patch in {broken}; selecting every test", file=sys.stderr)
+#         return set(tests_by_number)
+#
+# (If SQLGLOT_ROOT does not exist the guard finds nothing, so it fails safe to today's behavior.
+#  The existing try/except in main() still turns any exception into "select every test".)
+
 
 def load_shard(path: str):
     shard_file = MAPS / "shards" / (path.replace("/", "__") + ".json")
@@ -146,7 +251,8 @@ def main() -> None:
 
             # Handle fixture changes.
             if file_path.startswith("tests/fixtures/"):
-                picked_idx.update(fixture_map.get(file_path, []))
+                tracked = fixture_map.get(file_path, [])
+                picked_idx.update(tracked)
 
                 # Name heuristic, kept as a union with the tracker's fixture map.
                 name = Path(file_path).stem.removesuffix("_ddl").rstrip("s")
