@@ -113,10 +113,18 @@ def main() -> None:
                 line_map = coverage.get(file_path, {})
                 pool_line_map = pool_coverage.get(file_path, {})
 
-                # Only select tests that executed a changed line.
+                file_tests = None
                 for line in lines:
-                    selected_numbers.update(line_map.get(str(line), []))
-                    selected_numbers.update(pool_line_map.get(str(line), []))
+                    found = set(line_map.get(str(line), [])) | set(pool_line_map.get(str(line), []))
+                    if found:
+                        selected_numbers.update(found)
+                    elif line >= 1:
+                        # No test ever ran this line (import-time code, constants,
+                        # blank or comment lines): select every test that touches the file.
+                        if file_tests is None:
+                            file_tests = {n for nums in line_map.values() for n in nums}
+                            file_tests |= {n for nums in pool_line_map.values() for n in nums}
+                        selected_numbers.update(file_tests)
 
         selected = [
             tests_by_number[number]
